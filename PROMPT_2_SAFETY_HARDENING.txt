@@ -1,0 +1,992 @@
+PROMPT 2 — SAFETY HARDENING ADDENDUM
+SYSTEM MODE: HERMES v2 — SAFETY HARDENING ADDENDUM (STEPS 0, 5B–5D, 6B–6E, 7–8)
+
+You are working on an existing intraday trading system built in a previous session.
+
+This is PROMPT 2 of 2.
+
+PROMPT 1 built the core deterministic learning trading engine.
+
+PROMPT 2 hardens that engine without breaking existing behavior.
+
+Your job:
+
+- Preserve the existing core engine
+- Add safety wrappers and validation gates
+- Do not rewrite the core engine
+- Do not remove existing logic
+- Keep all old tests passing
+- Add tests for every new safety rule
+- Keep changes minimal, isolated, and backward compatible
+
+--------------------------------------------------
+ADDENDUM RULES — NON-NEGOTIABLE
+--------------------------------------------------
+
+- Do NOT remove existing logic
+- Do NOT rename existing public outputs
+- Do NOT change existing function signatures unless absolutely required
+- Do NOT refactor unrelated files
+- Do NOT change tests that already pass unless required for new safety coverage
+- Add only minimal, isolated code
+- Preserve backward compatibility at all times
+- Any new behavior must be covered by tests
+- Existing output fields must remain available
+- New fields may be added only if they do not break existing consumers
+- Safety rules in this addendum take precedence over Prompt 1 behavior
+- If safety rules conflict with existing logic, wrap or gate the old logic
+  instead of deleting it
+
+Implementation order per sub-step:
+
+1. Add tests first
+2. Implement the smallest code change needed
+3. Run all tests
+4. Fix failures
+5. Continue only when ALL tests pass
+
+Show minimal diffs only.
+Explain briefly.
+Do not dump full files.
+
+--------------------------------------------------
+SYSTEM MODES
+--------------------------------------------------
+
+The system must support three execution modes:
+
+- backtest_mode
+- paper_mode
+- live_mode
+
+Rules:
+
+1. backtest_mode
+
+- Used for historical validation
+- May simulate fills, fees, slippage, and resets
+- Must never use future data
+- Must remain deterministic
+
+2. paper_mode
+
+- Used for forward simulated trading
+- Must behave like live mode except no real orders are sent
+- Must include cost/slippage assumptions
+- Must produce completed trade records
+- Must feed the learning and validation layers
+
+3. live_mode
+
+- Used for real trading only after paper validation passes
+- Requires kill switch protection
+- Requires valid cost model
+- Requires valid account/equity state
+- Requires explicit safe reset after critical failures
+- Must never auto-reset during active edge decay
+- Must require explicit live_enabled = true before any real order execution
+
+If mode is missing or unknown:
+
+{
+  "trade_allowed": false,
+  "reason": "invalid_system_mode"
+}
+
+Backward compatibility rule:
+
+If legacy Prompt 1 code has no explicit system_mode field,
+treat it as backtest_mode during migration only.
+
+After Step 0 / mode validation is implemented,
+new entrypoints must require explicit system_mode.
+
+Do not break old Prompt 1 tests only because system_mode was previously absent.
+
+--------------------------------------------------
+PROMPT 1 / PROMPT 2 BRIDGE RULE
+--------------------------------------------------
+
+Prompt 2 safety rules supersede unsafe or less conservative behavior from Prompt 1.
+
+Specifically:
+
+- Any direct threshold update behavior from Prompt 1 Step 6 must be wrapped
+- The old logic must not be deleted
+- Any threshold update must become a candidate threshold proposal
+- Active thresholds may be modified only through the OOS promotion gate
+- Existing Prompt 1 tests must still pass
+- Existing Prompt 1 output fields must remain supported
+
+If a conflict is detected:
+
+- Do NOT delete existing behavior
+- Add a compatibility wrapper
+- Add a feature flag if needed
+- Preserve old output
+- Add tests proving old behavior still works
+- Explain the conflict before changing behavior
+
+--------------------------------------------------
+STEP 0 — DATA CONTRACT AND INPUT SAFETY
+--------------------------------------------------
+
+Goal:
+
+Prevent invalid market data, corrupted candles, duplicate timestamps,
+stale data, and hidden lookahead problems before any signal is calculated.
+
+Tasks:
+
+1. Define and validate required candle schema:
+
+{
+  "timestamp": int | str,
+  "open": float,
+  "high": float,
+  "low": float,
+  "close": float,
+  "volume": optional float
+}
+
+2. Validate:
+
+- candles sorted ascending by timestamp
+- no duplicate timestamps
+- open/high/low/close are present
+- OHLC values are numeric
+- high >= low
+- high >= open
+- high >= close
+- low <= open
+- low <= close
+- volume, if present, is numeric and >= 0
+
+3. Enforce:
+
+- current decision may use only candles with timestamp <= current decision timestamp
+- future candles must never be visible to signal, regime, confidence,
+  risk, backtest, paper, live, or learning logic
+- invalid candle data must block trading safely
+- stale data must block trading safely in paper/live mode
+
+4. Output when blocked by invalid data:
+
+{
+  "trade_allowed": false,
+  "reason": "invalid_market_data"
+}
+
+5. Output when blocked by stale data:
+
+{
+  "trade_allowed": false,
+  "reason": "stale_market_data"
+}
+
+6. Add tests:
+
+tests/test_data_contract.py
+
+Tests must cover:
+
+- missing fields
+- invalid OHLC relationships
+- duplicate timestamps
+- unsorted candles
+- future candle rejection
+- valid candles passing validation
+- stale data blocks paper/live mode
+- stale data behavior is deterministic
+
+--------------------------------------------------
+STEP 5B — TRADE LIFECYCLE CONTRACT
+--------------------------------------------------
+
+Goal:
+
+Make backtesting and learning complete by defining how trades enter,
+stay open, exit, and become completed memory records.
+
+This extends Step 5 without breaking it.
+
+Tasks:
+
+1. Define deterministic trade lifecycle:
+
+signal
+→ entry decision
+→ risk validation
+→ open position
+→ exit decision
+→ completed trade
+→ memory log
+→ attribution analysis
+
+2. Entry is allowed only if existing Step 5 eligibility gate passes.
+
+3. Exit rules must be deterministic and based only on available data.
+
+Supported exit reasons:
+
+- stop_loss
+- take_profit
+- max_holding_bars
+- signal_decay
+- risk_guardrail
+- end_of_backtest
+
+Exit reason definitions:
+
+- stop_loss: exit_price <= entry_price - configured_stop_distance
+- take_profit: exit_price >= entry_price + configured_take_profit_distance
+- max_holding_bars: bars_held >= configured_max_holding_bars
+- signal_decay: combined_value drops below configured_signal_decay_threshold while position is open
+- default configured_signal_decay_threshold = 0.30
+- risk_guardrail: risk manager blocks continuation of open position
+- end_of_backtest: position forcibly closed at last available candle
+
+4. Required exit fields:
+
+{
+  "exit_reason": string,
+  "exit_price": float,
+  "bars_held": int,
+  "pnl": float,
+  "fees": float,
+  "slippage": float,
+  "spread_cost": float,
+  "net_pnl": float
+}
+
+5. No trade may be counted in performance results unless it is completed.
+
+6. No completed trade may exist without:
+
+- entry timestamp
+- exit timestamp
+- entry price
+- exit price
+- exit reason
+- net_pnl
+
+7. Add tests:
+
+tests/test_trade_lifecycle.py
+
+Tests must ensure:
+
+- no completed trade without entry and exit
+- exit uses no future data
+- exit_reason is always valid enum
+- net_pnl includes fees and costs
+- incomplete trades are not included in final performance metrics
+- lifecycle output remains deterministic
+
+--------------------------------------------------
+STEP 5C — COST, SLIPPAGE, AND EXECUTION MODEL
+--------------------------------------------------
+
+Goal:
+
+Prevent unrealistic backtest, paper, and live validation results.
+
+Tasks:
+
+1. Every backtest and paper trade must include:
+
+- commission / fee
+- spread or slippage estimate
+- entry fill model
+- exit fill model
+
+2. Net PnL must always be calculated after:
+
+- fees
+- slippage
+- spread if configured
+
+3. Default behavior:
+
+If cost model is missing, block performance validation and return:
+
+{
+  "validation_passed": false,
+  "reason": "missing_cost_model"
+}
+
+4. In live_mode, missing cost model must block trading:
+
+{
+  "trade_allowed": false,
+  "reason": "missing_cost_model"
+}
+
+5. Cost model must be:
+
+- deterministic
+- configurable
+- explainable
+- applied consistently to all completed trades
+
+6. Add tests:
+
+tests/test_cost_model.py
+
+Tests must ensure:
+
+- gross_pnl != net_pnl when fees/slippage exist
+- missing cost model blocks validation
+- missing cost model blocks live trading
+- cost calculation is deterministic
+- net_pnl never ignores fees
+- performance report marks cost_model_applied correctly
+
+--------------------------------------------------
+STEP 5D — POSITION SIZING SAFETY
+--------------------------------------------------
+
+Goal:
+
+Prevent confidence score from creating unsafe position size.
+
+Tasks:
+
+1. Position size must be capped by ALL of:
+
+- available capital
+- max_position_pct_of_equity
+- max_risk_per_trade
+- configured_absolute_risk_cap
+- stop_loss distance
+- confidence multiplier cap
+
+2. Confidence may scale position size, but must never override risk caps.
+
+3. Position sizing formula must follow this structure:
+
+risk_amount = min(
+  equity * max_risk_per_trade,
+  configured_absolute_risk_cap
+)
+
+confidence_adjusted_risk = risk_amount * confidence_multiplier
+
+position_size = confidence_adjusted_risk / stop_distance
+
+final_position_size = min(
+  position_size,
+  equity * max_position_pct_of_equity,
+  available_capital
+)
+
+4. If stop_distance <= 0:
+
+{
+  "trade_allowed": false,
+  "reason": "invalid_stop_distance"
+}
+
+5. If account equity is missing in paper/live mode:
+
+{
+  "trade_allowed": false,
+  "reason": "account_equity_unavailable"
+}
+
+6. Add tests:
+
+tests/test_position_sizing.py
+
+Tests must ensure:
+
+- position size never exceeds max_position_pct_of_equity
+- confidence cannot override risk cap
+- invalid stop distance blocks trade
+- missing equity blocks paper/live trading
+- same input produces same position size
+- high confidence never bypasses caps
+
+--------------------------------------------------
+STEP 6B — LEARNING SAFETY: CANDIDATE THRESHOLDS
+--------------------------------------------------
+
+Goal:
+
+Prevent the learning loop from overfitting to recent trades.
+
+This extends Step 6 without removing the existing learning loop.
+
+Critical rule:
+
+The learning layer must NOT directly modify active live thresholds
+from the same data it analyzes.
+
+This step supersedes any direct threshold update behavior from the original Step 6.
+
+Do not delete the old Step 6 logic.
+
+Wrap it so that any threshold update becomes a candidate threshold proposal.
+
+Existing tests from Step 6 must still pass.
+
+New behavior must ensure that active thresholds are modified only
+through the OOS promotion gate.
+
+All threshold changes must follow this promotion flow:
+
+1. Analyze completed historical trades
+2. Generate candidate_thresholds
+3. Validate candidate_thresholds on a later out-of-sample window
+   not used for discovery
+4. Promote candidate_thresholds to active_thresholds only if validation passes
+5. Reject candidate_thresholds if validation fails
+
+Required files:
+
+- active_thresholds.json
+- candidate_thresholds.json
+- threshold_adaptation_log.json
+
+Rules:
+
+- active_thresholds are used for all trading decisions
+- candidate_thresholds are proposed changes only
+- candidate_thresholds must never affect trading until promoted
+- every promotion or rejection must be logged
+- rejected candidates must not modify active thresholds
+- candidate thresholds must remain bounded
+- active thresholds must remain backward compatible with existing threshold structure
+
+Promotion is allowed only if:
+
+- out-of-sample win_rate improves or remains stable
+- profit_factor improves or remains stable
+- max_drawdown does not increase materially
+- trade_count remains statistically meaningful
+- no edge_decay_alert is active
+- no kill_switch_active state exists
+- validation window is strictly later than discovery window
+
+If promotion fails:
+
+{
+  "thresholds_adapted": false,
+  "reason": "candidate_rejected_oos_validation"
+}
+
+Add tests:
+
+tests/test_candidate_thresholds.py
+
+Tests must ensure:
+
+- candidate thresholds do not affect active trading
+- failed validation does not modify active thresholds
+- successful validation promotes candidate thresholds
+- promotion/rejection is logged
+- thresholds remain bounded
+- old Step 6 outputs remain supported
+- direct threshold updates are blocked when addendum is active
+
+--------------------------------------------------
+STEP 6C — SAMPLE SIZE HARDENING
+--------------------------------------------------
+
+Goal:
+
+Prevent learning from tiny samples.
+
+Update attribution and adaptation minimums:
+
+1. Confidence bucket analysis:
+
+- default min_trades_per_bucket = 20
+
+2. Regime analysis:
+
+- default min_trades_per_regime = 30
+
+3. Confidence bucket × regime cross-analysis:
+
+- default min_trades_per_combination = 50
+
+4. Threshold adaptation:
+
+- never adapt before at least 100 completed trades total
+- never adapt from any bucket/regime combination below its minimum
+
+5. All minimums must be configurable, not hardcoded.
+
+6. For unit tests only:
+
+- smaller minimums may be injected via test config
+- production/default config must remain conservative
+
+7. If sample size is insufficient:
+
+{
+  "thresholds_adapted": false,
+  "reason": "insufficient_sample_size"
+}
+
+Add tests:
+
+tests/test_sample_size_rules.py
+
+Tests must ensure:
+
+- no attribution result is produced below minimum sample size
+- no threshold update happens before 100 completed trades by default
+- cross-analysis requires at least 50 trades per combination by default
+- insufficient sample size produces clear reason
+- test-injected smaller minimums do not alter production defaults
+
+--------------------------------------------------
+STEP 6D — OUT-OF-SAMPLE VALIDATION BEFORE PROMOTION
+--------------------------------------------------
+
+Goal:
+
+Ensure the learning engine validates changes on unseen later data
+before accepting them.
+
+Tasks:
+
+1. Split completed historical trades into:
+
+- discovery window
+- validation window
+
+2. Candidate thresholds may be discovered only from the discovery window.
+
+3. Candidate thresholds must be tested only on the later validation window.
+
+4. Validation window must be strictly later in time than discovery window.
+
+5. Reject if:
+
+- validation window overlaps discovery window
+- validation window is earlier than discovery window
+- validation trade count is below minimum
+- profit_factor deteriorates materially
+- max_drawdown increases materially
+- stability_score falls below threshold
+- candidate improves win_rate but worsens risk materially
+- candidate reduces trade count below meaningful threshold
+
+6. Validation must compare:
+
+- current active thresholds
+- proposed candidate thresholds
+
+on the same validation window.
+
+7. Add tests:
+
+tests/test_oos_promotion_gate.py
+
+Tests must ensure:
+
+- discovery and validation windows do not overlap
+- validation must be later than discovery
+- weak OOS result rejects candidate
+- strong OOS result allows promotion
+- future data is never used during discovery
+- win_rate improvement alone is insufficient if drawdown worsens materially
+- active thresholds remain unchanged after rejection
+
+--------------------------------------------------
+STEP 6E — PERFORMANCE CLAIM SAFETY
+--------------------------------------------------
+
+Goal:
+
+Avoid false claims about improvement.
+
+Replace any interpretation of:
+
+"Win rate must improve over time — provably"
+
+With the safer rule:
+
+The system must measure performance over time and only accept
+parameter changes that improve or preserve out-of-sample robustness.
+
+The system must never assume that win rate will improve.
+
+Rules:
+
+- Do not force improvement
+- Do not fabricate improvement
+- Do not optimize only for win_rate
+- Prefer robustness over higher win_rate
+- A lower win_rate with better profit_factor and lower drawdown may be acceptable
+- Any improvement claim must be supported by logged validation results
+- If evidence is insufficient, report insufficient evidence
+- If performance worsens, report it clearly
+
+Add tests:
+
+tests/test_performance_claim_safety.py
+
+Tests must ensure:
+
+- system can reject adaptation even after many losses
+- system does not force threshold updates
+- system does not claim improvement without validation evidence
+- win_rate alone is not enough for promotion
+- insufficient evidence produces a clear result
+- rejected candidates do not produce improvement claims
+
+--------------------------------------------------
+STEP 7 — PAPER TRADING VALIDATION GATE
+--------------------------------------------------
+
+Goal:
+
+Prevent premature live deployment.
+
+Before live trading, system must pass paper trading validation.
+
+Promotion to live mode is allowed only if ALL pass:
+
+- minimum 100 completed paper trades
+- profit_factor >= configured minimum, default 1.20
+- max_drawdown <= configured maximum
+- no lookahead bias detected
+- no data leakage detected
+- no active edge_decay_alert
+- no active kill switch
+- valid cost model exists
+- valid account/equity state exists
+- stable results across at least 3 market regimes if available in data
+
+If fewer than 3 regimes exist in the validation data:
+
+- report insufficient_regime_diversity
+- do not fail silently
+- allow config to decide whether this blocks live promotion
+
+If paper validation fails:
+
+{
+  "live_enabled": false,
+  "reason": "paper_validation_failed"
+}
+
+Optional detailed reason:
+
+{
+  "live_enabled": false,
+  "reason": "paper_validation_failed",
+  "details": string
+}
+
+Live activation rule:
+
+Passing paper validation does not automatically enable real trading.
+
+live_mode may execute real orders only if:
+
+- paper validation passed
+- live_enabled explicitly set to true
+- kill switch is inactive
+- all live safety checks pass
+
+If live_enabled is missing or false:
+
+{
+  "trade_allowed": false,
+  "reason": "live_not_explicitly_enabled"
+}
+
+Add tests:
+
+tests/test_paper_trading_gate.py
+
+Tests must ensure:
+
+- live mode blocked below 100 paper trades
+- live mode blocked when profit_factor too low
+- live mode blocked when max_drawdown too high
+- live mode blocked during edge decay
+- live mode blocked during active kill switch
+- live mode blocked when cost model is missing
+- live mode blocked when live_enabled is missing or false
+- live mode allowed only when all validation rules pass
+- insufficient regime diversity is reported clearly
+
+--------------------------------------------------
+STEP 8 — LIVE SAFETY KILL SWITCH
+--------------------------------------------------
+
+Goal:
+
+Immediately stop trading during any unsafe live condition.
+
+System must activate kill switch if ANY of the following occurs:
+
+- daily loss limit reached
+- max consecutive losses reached
+- data feed stale
+- duplicate candle detected
+- invalid candle detected
+- abnormal slippage detected
+- execution error detected
+- active edge_decay_alert
+- cost model missing
+- account equity unavailable
+- position state mismatch
+- unknown system mode
+- corrupted threshold config
+- corrupted trade state
+
+Abnormal slippage is defined as ANY of:
+
+- actual_slippage > configured_max_slippage
+- actual_slippage > expected_slippage * configured_slippage_multiplier
+
+Position state mismatch is defined as ANY of:
+
+- engine believes a position is open but account/broker state shows no position
+- account/broker state has an open position not tracked by engine
+- multiple open positions exist when only one is allowed
+- tracked position size differs materially from actual position size
+- entry price is missing for an open position
+
+Corrupted threshold config is defined as ANY of:
+
+- required threshold keys are missing
+- any threshold value is outside its valid range
+- threshold file is unreadable or inaccessible
+- threshold file produces a JSON parse error
+- threshold file contains non-numeric values where numeric is required
+- threshold config version is missing or unsupported
+- candidate threshold schema does not match active threshold schema
+
+When kill switch is active:
+
+{
+  "trade_allowed": false,
+  "reason": "kill_switch_active",
+  "kill_switch_reason": string
+}
+
+Kill switch rules:
+
+- kill switch overrides all signal and confidence logic
+- kill switch cannot be bypassed by high confidence
+- kill switch state must be logged with timestamp and reason
+- system requires explicit safe reset before trading resumes
+- kill switch state must be deterministic and inspectable
+- kill switch must preserve the original reason that triggered it
+
+--------------------------------------------------
+SAFE RESET RULES
+--------------------------------------------------
+
+For live_mode:
+
+Safe reset requires ALL of:
+
+- manual_reset flag explicitly set to True
+- all safety checks pass
+- no active edge_decay_alert
+- no unresolved execution error
+- valid recent candle stream
+- valid account/equity state
+- valid cost model
+- reset attempt logged with timestamp and reason
+
+Live mode must NOT auto-reset.
+
+For backtest_mode and paper_mode only:
+
+Automatic reset may be allowed if ALL pass:
+
+- last N consecutive candles are valid, default N=10
+- no execution errors for X minutes or equivalent simulated period, default X=30
+- no active edge_decay_alert
+- valid cost model
+- reset attempt logged
+
+If reset attempt fails validation:
+
+- kill switch remains active
+- failed reset reason is logged
+
+System cannot self-reset during active edge_decay_alert in any mode.
+
+Add tests:
+
+tests/test_kill_switch.py
+
+Tests must ensure:
+
+- kill switch blocks all trading
+- confidence cannot override kill switch
+- kill switch reason is preserved in output
+- stale data activates kill switch
+- execution error activates kill switch
+- edge decay activates kill switch
+- missing cost model activates kill switch in live mode
+- account equity unavailable activates kill switch in live mode
+- abnormal slippage activates kill switch
+- position state mismatch activates kill switch
+- corrupted threshold config activates kill switch
+- live mode cannot auto-reset
+- kill switch cannot self-reset during edge_decay_alert
+- reset attempt is always logged
+- system resumes only after valid reset conditions are met
+
+--------------------------------------------------
+BACKWARD COMPATIBILITY REQUIREMENT
+--------------------------------------------------
+
+Existing final output must remain fully supported:
+
+{
+  "trade_allowed": true/false,
+  "confidence": float,
+  "agreement": float,
+  "regime": string,
+  "position_size": float,
+  "reason": string
+}
+
+Existing learning layer output must remain fully supported:
+
+{
+  "total_trades": int,
+  "overall_win_rate": float,
+  "best_conditions": [...],
+  "worst_conditions": [...],
+  "thresholds_adapted": bool,
+  "edge_decay_alert": bool
+}
+
+New optional fields may be added only additively:
+
+{
+  "candidate_thresholds_created": bool,
+  "candidate_thresholds_promoted": bool,
+  "candidate_rejection_reason": string,
+  "sample_size_ok": bool,
+  "oos_validation_passed": bool,
+  "live_enabled": bool,
+  "kill_switch_active": bool,
+  "kill_switch_reason": string,
+  "system_mode": string,
+  "cost_model_applied": bool,
+  "paper_validation_passed": bool,
+  "insufficient_regime_diversity": bool
+}
+
+Existing fields must not be removed or renamed.
+
+New fields must be additive only.
+
+--------------------------------------------------
+NON-DESTRUCTIVE RULE
+--------------------------------------------------
+
+If any new safety addition conflicts with existing behavior:
+
+- Do NOT delete existing behavior
+- Add a compatibility wrapper
+- Add a feature flag if needed
+- Preserve old output
+- Add tests proving old behavior still works
+- Explain the conflict before changing anything
+
+--------------------------------------------------
+VALIDATION LOOP
+--------------------------------------------------
+
+After each sub-step:
+
+1. Run ALL tests — old and new
+2. If ANY test fails:
+   - fix immediately
+3. Continue only when ALL tests pass
+4. Show minimal diff only
+5. Explain what changed in one sentence
+6. Mention tests added
+7. Mention tests run
+8. Mention final test status
+
+Do not continue with broken tests.
+Do not delete tests to make the suite pass.
+Do not weaken tests without explaining why.
+
+--------------------------------------------------
+RECOMMENDED IMPLEMENTATION ORDER
+--------------------------------------------------
+
+1. Data contract — Step 0
+2. Cost model — Step 5C
+3. Trade lifecycle — Step 5B
+4. Position sizing safety — Step 5D
+5. Candidate thresholds — Step 6B
+6. Sample size hardening — Step 6C
+7. OOS promotion gate — Step 6D
+8. Performance claim safety — Step 6E
+9. Paper trading gate — Step 7
+10. Kill switch — Step 8
+
+Do not implement all additions at once.
+Each step must be independently testable.
+
+--------------------------------------------------
+STOP CONDITION
+--------------------------------------------------
+
+Stop when:
+
+- All addendum steps are implemented
+- All old tests still pass
+- All new tests pass
+- System produces the existing output block
+- System produces the existing learning output block
+- Candidate thresholds are separated from active thresholds
+- OOS promotion gate is active and tested
+- Paper trading gate is active and tested
+- Kill switch is active and tested
+- Live mode cannot start without passing paper validation
+- Live mode cannot auto-reset after kill switch
+
+--------------------------------------------------
+DO NOT
+--------------------------------------------------
+
+- Do not add features beyond what is listed here
+- Do not optimize PnL artificially
+- Do not remove or rename existing logic
+- Do not bypass old tests
+- Do not bypass new tests
+- Do not directly modify active thresholds without OOS promotion
+- Do not allow live trading without paper validation
+- Do not allow real order execution unless live_enabled is explicitly true
+- Do not allow high confidence to bypass risk rules
+- Do not allow high confidence to bypass kill switch
+- Do not allow live auto-reset
+- Do not claim improvement without validation evidence
+
+--------------------------------------------------
+END GOAL
+--------------------------------------------------
+
+A hardened trading engine that:
+
+- Preserves the working core from Prompt 1
+- Blocks bad data before signal generation
+- Uses realistic cost and slippage assumptions
+- Completes trades through a deterministic lifecycle
+- Sizes positions safely
+- Learns through candidate thresholds, not direct live mutation
+- Promotes changes only after out-of-sample validation
+- Requires paper validation before live mode
+- Requires explicit live_enabled = true before real order execution
+- Stops immediately under unsafe conditions
+- Remains deterministic, testable, explainable, and backward compatible

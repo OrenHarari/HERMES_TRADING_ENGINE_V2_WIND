@@ -29,7 +29,11 @@ virtualenv/
 Thumbs.db
 
 # Runtime data (created by ThresholdStore at runtime)
-data/
+/data/
+
+# Runtime reports (created by hermes.reports.write_run_report at runtime).
+# Anchored to repo root so the source package `hermes/reports/` is NOT ignored.
+/reports/
 
 # Build artifacts
 build/
